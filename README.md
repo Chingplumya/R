@@ -44,7 +44,7 @@ library(knitr)
 
 purl(input = "survival_analysis.Rmd", output = "full_extract_code.R", documentation = 1)
 ## 方式4：直接查看html文件
-如缺乏运行环境，也可直接在浏览器中查看该仓库的survival_analysis.html文件
+如缺乏运行环境，也可直接在浏览器中查看该仓库的survival_analysis_report.html文件
 
 # 四、关键建模方案说明
 ## 1.精简双变量 Cox 模型优势
