@@ -1,0 +1,587 @@
+---
+title: "肿瘤随访数据生存分析建模报告"
+author: "陈逸萧"
+date: "2026-07-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# R语言临床生存分析报告
+本文档基于 R Markdown 编写，可一键渲染生成 HTML、PDF 标准化分析报告。
+文档整合研究背景文字说明、数据处理代码、统计输出与可视化图表，实现分析流程全可复现。
+
+点击上方 **Knit** 按钮即可输出完整报告，文档会同时展示代码、统计结果与绘图。
+下方为本项目依赖包：
+
+```{r 载入包}
+library(survival)
+library(tidyverse)
+library(survminer)
+library(broom)
+```
+
+# 1 数据准备
+使用survival包内置lung肺癌随访数据，共228例晚期肺癌患者，探究性别、年龄、体能评分等对生存预后的影响。
+
+## 1.1 数据集变量介绍
+
+inst，机构代码 (Institution code) 表示患者所在的治疗中心编号。通常作为随机效应或控制变量，但在本小样本分析中常被忽略。
+
+time，生存时间 (Survival time) 目标变量之一。记录从入组到死亡或最后一次随访的天数。单位：天 (Days)
+
+status，生存状态 (Censoring status) 目标变量之二。指示观察结束时患者的状态。
+1 = 删失 (Censored): 患者仍存活或失访
+2 = 死亡 (Dead): 事件发生
+
+age，年龄 (Age in years)。单位：岁 (Years)
+
+sex，性别。1 = 男 (Male)，2 = 女 (Female)
+
+ph.ecog，ECOG 体力评分 (ECOG performance score) 关键预测因子。评估患者日常活动能力，分数越高身体状况越差。
+0: 正常活动
+1: 轻微症状，能从事轻体力活动
+2: 白天卧床<50%
+3: 白天卧床>50%
+4: 完全卧床
+5: 死亡
+
+ph.karno，医生评分的 Karnofsky 评分 (Karnofsky score rated by physician)，评估患者功能状态的百分制评分。
+分数越高越好（与 ECOG 相反）。范围：0-100 (100=完全健康)
+
+pat.karno，患者自评的 Karnofsky 评分 (Karnofsky score rated by patient)，患者对自己身体状况的主观评分。
+常与医生评分对比，分析主观感知对预后的影响。范围：0-100
+
+eal.cal，每日卡路里摄入量 (Calories consumed at meals)
+营养状况指标。营养不良是癌症患者预后不良的重要标志。单位：千卡/天 (kcal/day)
+
+wt.loss，体重丢失 (Weight loss in last 6 months)
+过去 6 个月内体重下降的磅数。单位：磅 (lbs)。
+负值 = 增重，正值 = 减重
+
+## 1.2 原始数据载入
+
+```{r 原始数据载入}
+df_raw <- lung
+```
+
+## 1.3 分步数据清洗、变量重编码
+### 1.3.1 inst列
+inst为标识性变量Identifier，它本身没有直接的临床预测意义，仅确认有无数据丢失并检查分布。大样本中该项或许存在一定相关性（不同医疗机构的医疗水平不同，对患者预后有影响），但此项目不作考虑。
+经确认，缺失1项，分布无明显失衡，决策：直接删除。
+
+```{r inst列}
+sum(is.na(df_raw$inst))
+df <- df_raw %>%
+  drop_na(inst)
+table(df$inst) #查看分布
+```
+
+### 1.3.2 time列
+time作为生存分析核心目标变量，如有缺失一般直接删除，避免中位数填充（扭曲KM曲线）或均值填充（引入巨大噪声）。
+time列变量名容易与R内置“时间”等变量冲突，将其改为survival_days。
+
+```{r time列}
+sum(is.na(df$time)) #查看缺失值
+sum(df$time <= 0) #查看小于等于0的异常值
+summary(df$time) #查看描述性统计，排除极大极小值
+df <- df %>%
+  rename(survival_days = time) %>%
+  drop_na(survival_days) %>%
+  filter(survival_days > 0)
+```
+
+### 1.3.3 status列
+同survival_days，对于终点事件（Endpoint）缺失的数据，唯一的科学处理方法是剔除（Exclusion），并在报告中说明剔除比例。
+原始数据为1/2，考虑改为0/1方便建模。
+
+```{r status列}
+df <- df %>%
+  drop_na(status) %>%
+  mutate(status = status - 1)
+unique(df$status) #检验是否仅为0/1，不存在其他异常值
+```
+
+### 1.3.4 age列
+实际无缺失值，如有考虑用中位数填补
+
+```{r age列}
+sum(is.na(df$age))
+summary(df$age)
+```
+
+### 1.3.5 sex列
+实际无缺失值，如有考虑用众数填补（较少）或增设第三类Unknown（较多）
+原始数据为1/2，考虑改为0/1方便建模。
+
+```{r sex列}
+sum(is.na(df$sex))
+df <- df %>%
+  mutate(sex = sex - 1)
+unique(df$sex)
+```
+
+### 1.3.6 ph.ecog列
+有一个缺失值，用众数填充
+
+```{r ph.ecog列}
+sum(is.na(df$ph.ecog))
+unique(df$ph.ecog)
+df <- df %>%
+  mutate(
+    ecog_mode = as.numeric(names(sort(table(ph.ecog), decreasing = TRUE, na.rm = TRUE))[1]),
+    ph.ecog = ifelse(is.na(ph.ecog), ecog_mode, ph.ecog)
+  )
+```
+
+### 1.3.7 ph.karno列
+有一个缺失值，用众数填充
+
+```{r ph.karno列}
+sum(is.na(df$ph.karno))
+summary(df$ph.karno)
+unique(df$ph.karno)
+df <- df %>%
+  mutate(
+    karno_mode = as.numeric(names(sort(table(ph.karno), decreasing = TRUE, na.rm = TRUE))[1]),
+    ph.karno = ifelse(is.na(ph.karno), karno_mode, ph.karno)
+  )
+```
+
+### 1.3.8 pat.karno列
+有三个缺失值，用中位数填充
+
+```{r karno列}
+sum(is.na(df$pat.karno))
+summary(df$pat.karno)
+unique(df$pat.karno)
+df <- df %>%
+  mutate(
+    pat.karno = ifelse(
+      is.na(pat.karno),
+      median(pat.karno, na.rm = T),
+      pat.karno
+    )
+  )
+```
+
+### 1.3.9 meal.cal列
+缺失值47个，达到20%的缺失率，考虑使用回归插补，利用其他变量预测
+暂时搁置
+
+```{r meal.cal列}
+sum(is.na(df$meal.cal))
+summary(df$meal.cal)
+```
+
+### 1.3.10 wt.loss列
+缺失值14个，达到6%的缺失率，优先于meal.cal处理
+
+```{r wt.loss列}
+sum(is.na(df$wt.loss))
+summary(df$wt.loss)
+```
+
+## 1.4 利用回归插补法填充缺失值
+考虑选用之前处理完毕的基线变量（即age, sex, ph.ecog, ph.karno, pat.karno）进行回归建模。
+首先采用成对删除法建立相关性矩阵，算 A 和 B 的相关性时，只用 A 和 B 都不缺的那些行；算 A 和 C 时，只用 A 和 C 都不缺的行。最大化利用现有数据。
+
+```{r 相关性矩阵}
+df_clean <- df # 备份
+cor_vars <- df %>%
+  select(age, sex, ph.ecog, ph.karno, pat.karno, meal.cal, wt.loss)
+
+cor_mat <- cor(cor_vars, use = "pairwise.complete.obs")
+print(cor_mat)
+```
+
+### 缺失值填补策略对比与决策总结
+结果显示，ph.ecog与ph.karno高度负相关（|r|>0.7），信息重叠严重，这里剔除ph.karno。
+
+针对营养指标 wt.loss、meal.cal 线性相关性弱（|r|<0.2）、缺失程度分层的特征，对比 MICE 多重插补与有序级联残差抽样回归插补的适配性。
+
+决策依据：本数据集基线协变量数量有限，营养指标预测信噪比偏低；标准 MICE 依赖多轮迭代预测，在弱预测信息下无法提升填补精度，还会放大原生数据噪声；本研究采用模型真实残差有放回抽样作为扰动项，不强制正态分布假设，能完整复刻原始数据残差分布，兼顾分布保真与轻量化计算。
+
+实施流程：有序级联填补，先处理低缺失率 wt.loss（缺失 6%），通过线性模型预测缺失样本期望值，抽取模型原始残差叠加至预测值完成填充；再将填补完成的 wt.loss 作为新增协变量，重复残差抽样逻辑填补高缺失率 meal.cal（缺失 20%）。全程保留全部 208 例有效样本，生成完整无缺失数据集。
+
+以下是wt.loss建模及插补过程：
+
+```{r wt.loss回归插补}
+fit_wt <- lm(
+  wt.loss ~ age + sex + ph.ecog + pat.karno,
+  data = df_clean
+)
+summary(fit_wt)
+idx_wt <- which(is.na(df$wt.loss))
+pred_wt <- predict(fit_wt, newdata = df[idx_wt,])
+set.seed(123)
+noise_wt <- sample(residuals(fit_wt), size = length(idx_wt), replace = T)
+df$wt.loss[idx_wt] <- pred_wt + noise_wt
+summary(df$wt.loss)
+```
+
+### wt.loss预测线性回归模型结果解读与填补方案支撑
+本模型以完整样本的年龄、性别、ECOG评分、患者自评KPS为自变量，构建多元线性回归预测体重丢失wt.loss，为后续缺失值插补提供预测基准。
+
+1. 整体有效性：模型全局F检验P<0.05，自变量联合具备显著预测作用，可作为缺失值预测基准；但校正决定系数仅0.0385，现有基线变量仅能解释3.85%的体重丢失变异，模型预测效能偏弱。
+2. 残差分布特征：模型残差区间跨度极大，存在明显偏态与极端离群值，不符合标准正态分布；若仅用模型预测值直接填充缺失，会大幅压缩数据离散度、丢失极端减重/增重样本。
+3. 变量预测贡献：仅性别、ECOG体能评分呈现边缘显著关联，年龄、患者自评KPS无预测价值，缺少营养、治疗等强关联协变量进一步限制模型精度。
+4. 方案选择依据：基于上述模型短板，本研究放弃正态随机噪声扰动，采用**有放回抽样提取模型原始残差叠加至预测值**的插补策略；该方法不强制正态假设，完整复刻原始残差的偏态分布与极端波动，最大程度还原真实wt.loss数值分布，兼顾样本完整性与数据分布保真度。
+
+以下是meal.cal建模及插补过程：
+
+```{r meal.cal回归插补}
+fit_cal <- lm(
+  meal.cal ~ age + sex + ph.ecog + pat.karno + wt.loss,
+  data = df
+)
+summary(fit_cal)
+idx_cal <- which(is.na(df$meal.cal))
+pred_cal <- predict(fit_cal, newdata = df[idx_cal,])
+set.seed(123)
+noise_cal <- sample(residuals(fit_cal), size = length(idx_cal), replace = T)
+imputed_values <- pred_cal + noise_cal
+# 物理约束：热量不能为负
+df$meal.cal[idx_cal] <- pmax(0, imputed_values)
+summary(df$meal.cal)
+```
+
+### meal.cal热量摄入预测模型与缺失填补结果解读
+本模型为级联填补第二步，以年龄、性别、ECOG医生评分、患者自评KPS、已完成填补的体重丢失wt.loss作为自变量，构建多元线性回归预测日均卡路里摄入meal.cal，用于20%中度缺失样本的插补。
+
+1. 模型整体性能：全局F检验P远小于0.001，模型高度显著；校正决定系数0.1133，相比仅使用基线临床变量的wt.loss模型预测能力大幅提升，验证了“先填补体重指标、再纳入热量预测模型”的有序级联策略可有效提升填补精度。
+2. 变量预测贡献：年龄、性别为极强独立预测因子，患者自评KPS存在弱正向关联；ECOG评分、体重丢失无单独显著关联，但wt.loss纳入后改善模型整体拟合效果。
+3. 残差分布特征：模型残差呈明显右偏，存在大量极端正向残差，不满足正态假设；因此采用抽取模型原生残差叠加预测值的扰动方案，相比人为正态噪声更贴合原始数据离散特征。
+4. 生理约束处理：预测叠加残差后可能生成无生理意义的负热量值，通过pmax函数设置下界0截断，剔除不合理填补数值，保证所有观测符合临床常识。
+5. 填补后分布校验：完成插补后meal.cal值域96~2600千卡，四分位数分布与原始完整样本特征一致，既保留极端高低摄入样本，又不存在负值失真，填补分布保真效果良好。
+
+### 研究局限性
+① 残差抽样采用有放回抽取，缺失样本量大时可能造成分布轻微收缩；
+② 暂未开展插补方案敏感性分析，缺少 MICE 多重插补对照，无法定量评估不同填补策略对后续生存模型系数、P 值的扰动。
+
+
+## 1.5 数据整合及分类变量转化
+选定即将参与建模的变量，并对sex、ph.ecog等变量做因子化处理。
+注：inst如参与建模，也需因子化（2号医疗机构相比1号医疗机构的疗效并不是所谓”2倍“的关系，即数字大小没有统计学意义）。这里不参与建模，鉴于可能有助于定位异常数据，选择保留。
+
+```{r 数据整合}
+df_final <- df %>%
+  select(inst, survival_days, status, age, sex, ph.ecog, pat.karno, meal.cal, wt.loss) %>%
+  mutate(
+    sex = factor(sex, levels = c(0, 1), labels = c("Male", "Female")),
+    ph.ecog = factor(ph.ecog, levels = 0:3, labels = c("0", "1", "2", "3"))
+  )
+```
+
+# 2 数据分析与建模
+## 2.1 绘制KM曲线
+将survival_days与status拟合为生存变量便于后续处理，同时对分类变量（sex与ecog评分）绘制KM曲线。
+
+```{r 性别KM曲线}
+surv_obj <- Surv(df_final$survival_days, df_final$status) #拟合生存对象
+fit_sex <- survfit(
+  surv_obj ~ sex,
+  data = df_final
+)
+ggsurvplot(fit_sex,
+           data = df_final,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE,
+           risk.table.height = 0.3,
+           title = "Survival Curve by Sex",
+           xlab = "Time (Days)",
+           palette = c("#2C7BB6", "#D7191C"))
+```
+
+### 性别分层KM生存曲线结果解读
+本图按性别分层绘制Kaplan-Meier生存曲线，搭配Log-rank检验与风险人数表，对比男女晚期肺癌患者长期生存差异。
+
+1. 组间差异显著性：Log-rank检验p=0.0014，小于0.05阈值，证明男性、女性患者生存曲线存在统计学显著区分。
+2. 生存趋势特征：女性生存曲线全程位于男性上方，任意随访天数下女性生存概率更高；男性曲线下降速度更快，短期随访阶段死亡事件累积更明显。
+3. 置信区间与稳健性：随访250天之后两组95%置信区间几乎无重叠，生存差距稳定，统计结论可信度高。
+4. 风险表样本损耗：基线男性样本137例、女性90例；各随访节点男性病例损耗比例更高，随访至1000天时女性全部发生死亡终点，仍存在2例男性截尾观测。
+5. 分析小结：性别是显著的单变量预后因素，女性晚期肺癌患者整体生存预后优于男性，后续将通过多因素Cox回归校正年龄、体能评分等混杂变量，验证性别是否为独立保护因素。
+
+接下来是ECOG评分KM曲线绘制，注意到ph.ecog=3样本量太小（仅为1），无95%置信区间，考虑合并稀疏分组。
+
+```{r ECOG评分KM曲线}
+df_final <- df_final %>%
+  mutate(
+    ph.ecog = as.numeric(as.character(ph.ecog)),
+    # 创建一个新的分组变量
+    ecog_group = case_when(
+      ph.ecog == 0 ~ "0 (Asymptomatic)",
+      ph.ecog == 1 ~ "1 (Symptomatic but ambulatory)",
+      ph.ecog >= 2 ~ "2-3 (Bedridden/Severe)" # 合并 2 和 3
+    ),
+    # 转化为因子，并指定顺序
+    ecog_group = factor(ecog_group, 
+                        levels = c("0 (Asymptomatic)", "1 (Symptomatic but ambulatory)", "2-3 (Bedridden/Severe)"))
+  )
+fit_ecog <- survfit(
+  surv_obj ~ ecog_group,
+  data = df_final
+)
+e_KM <- ggsurvplot(
+  fit_ecog,
+  data = df_final,
+  pval = TRUE,              
+  conf.int = TRUE,          
+  risk.table = TRUE,        
+  risk.table.height = 0.3, 
+  palette = c("#2C7BB6", "#FDAE61", "#D7191C"), 
+  title = "Survival Curve by ECOG Performance Status (Grouped)",
+  xlab = "Time (Days)",
+  ylab = "Probability of Survival",
+  legend.title = "ECOG Status",
+  legend.labs = c(
+    "0 (Asymptomatic)",
+    "1 (Ambulatory)",
+    "2-3 (Bedridden)"
+  ), # 统一规范图例文本，避免自动换行截断
+  pval.coord = c(60, 0.42), # 手动控制P值位置，不遮挡曲线
+  # 曲线美化参数
+  conf.int.alpha = 0.25,
+  surv.line.size = 1.1,
+  risk.table.y.text.col = TRUE,
+  # 关键：基础主题放ggtheme，自定义样式放入独立theme参数，不会被覆盖
+  ggtheme = theme_minimal()
+)
+# 修改上方生存曲线画布样式，增加边距、下移图例
+e_KM$plot <- e_KM$plot +
+  theme(
+    # 顶部、右侧大幅增加留白，防止文字裁切
+    plot.margin = margin(t = 30, r = 40, b = 20, l = 10),
+    # 图例移到图表底部横向排列，彻底避开顶部裁切区域
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    # 文字美化
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 11)
+  )
+
+# 同步修改下方风险表字体大小
+e_KM$table <- e_KM$table +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    text = element_text(size = 10.5)
+  )
+print(e_KM)
+```
+
+### ECOG体能分层KM生存曲线结果解读
+本图将原始0~3分ECOG体能评分合并为3组临床分层，通过Kaplan-Meier曲线与Log-rank检验，探究晚期肺癌患者活动能力与总生存的关联。
+
+1. 统计学结论：Log-rank检验p<0.0001，三组生存曲线存在极显著差异，ECOG体能状态是强有力的单变量预后指标。
+2. 梯度预后特征：生存曲线严格分层，无症状患者全程生存概率最高，轻症可活动患者次之，重度卧床患者死亡风险显著更高；体能状态越差，短期死亡事件爆发越集中，生存曲线下滑速率逐级加快。
+3. 结论稳健性：全随访周期三组95%置信区间几乎无交叉，Log-rank检验显著性极强，分层预后规律不受随访时长影响。
+4. 风险样本提示：重度卧床组基线样本最少，且各时间节点病例损耗比例最高，1000天随访终点无长期存活观测；轻症组虽样本基数最大，但生存预后仍弱于无症状人群。
+5. 后续分析规划：本单因素KM仅可证明分层存在生存差异，无法校正年龄、性别、营养指标等混杂变量；下一步将构建多因素Cox回归，验证ECOG体能分层是否为独立预后危险因素。
+
+## 2.2 单因素Cox回归定量分析
+循环运行单因素模型，然后逐个进行分析。
+注意到二分类及连续变量，无需特殊处理；
+多分类变量（有多行系数），策略是提取风险最高的一组（通常是最后一组，即Level 2-3 vs 0）作为代表
+
+```{r 单因素Cox回归}
+candidates <- c("sex", "ecog_group", "age", "pat.karno", "meal.cal", "wt.loss")
+univariate_results <- lapply(candidates, function(var) {
+  formula <- as.formula(paste("surv_obj ~", var))
+  cox_model <- coxph(formula, data = df_final)
+  summary_cox <- summary(cox_model)
+  
+  p_val_global <- summary_cox$waldtest["pvalue"]
+  
+  coef_tab <- summary_cox$coefficients
+  conf_tab <- summary_cox$conf.int
+  n_rows <- nrow(coef_tab)
+  
+  if (n_rows == 1) {
+    # 情况 A: 二分类 或 连续变量 (只有 1 行系数)
+    hr_val <- exp(coef_tab[1, 1])
+    lower_val <- conf_tab[1, 3]
+    upper_val <- conf_tab[1, 4]
+    display_hr <- round(hr_val, 3)
+    display_ci <- paste0(round(lower_val, 3), "-", round(upper_val, 3))
+  } else {
+    # 情况 B: 多分类变量 (有多行系数)
+    last_row <- n_rows
+    
+    hr_val <- exp(coef_tab[last_row, 1])
+    lower_val <- conf_tab[last_row, 3]
+    upper_val <- conf_tab[last_row, 4]
+    
+    display_hr <- round(hr_val, 3)
+    display_ci <- paste0(round(lower_val, 3), "-", round(upper_val, 4))
+  }
+  
+  # 提取关键指标
+  data.frame(
+    Variable = var,
+    HR = display_hr,
+    CI_95 = display_ci,
+    P_Value = round(p_val_global, 4),
+    Significant = ifelse(p_val_global < 0.05, "Yes", "No")
+  )
+})
+# 合并结果并排序
+results_df <- bind_rows(univariate_results) %>%
+  arrange(P_Value)
+
+print(results_df)
+```
+
+### 单因素Cox比例风险回归批量分析结果解读
+本小节对全部6项临床基线、营养指标批量构建单变量Cox回归，通过Wald检验筛选潜在预后因子，统一提取风险比HR、95%置信区间与全局P值，并按显著性升序排列。
+
+1. 显著预后因子筛选结果
+共4个变量单因素水平存在统计学意义（P<0.05）：
+- ecog_group（ECOG重度卧床分层）：HR=2.541，95%CI(1.636,3.946)，P=0.0001。为最强死亡危险因素；相比无症状患者，重度卧床晚期肺癌患者死亡风险提升154.1%，置信区间全程大于1，结论极稳健，与ECOG分层KM曲线梯度预后规律完全匹配。
+- pat.karno（患者自评KPS体能）：HR=0.981，95%CI(0.970,0.991)，P=0.0003。强保护因素，主观身体状态评分每升高1分，死亡风险降低1.9%。
+- sex（女性）：HR=0.589，95%CI(0.424,0.818)，P=0.0016。女性为保护因素，死亡风险仅为男性的58.9%，验证性别分层KM曲线女性预后更优的结论。
+- age（确诊年龄）：HR=1.019，95%CI(1.001,1.037)，P=0.0431。微弱危险因素，年龄每增长1岁死亡风险小幅上升1.9%，效应幅度很低，仅临界显著。
+
+2. 无预后价值变量
+wt.loss体重丢失、meal.cal日均卡路里摄入单因素建模P值均＞0.05，HR无限趋近于1，置信区间跨越无效值1；仅依靠营养指标无法单独预测晚期肺癌总生存。
+
+3. 后续多因素建模规划
+单因素显著的4个变量（ecog_group、pat.karno、sex、age）全部纳入多因素Cox回归模型，校正变量间混杂作用，筛选**独立预后危险因素**；wt.loss、meal.cal因单因素无统计学意义，暂不进入多因素模型。
+
+4. 分析局限
+1. 本批量代码多分类变量仅提取最高分层HR，未输出全部分层对比结果；
+2. 营养指标缺失值采用级联残差抽样填补，无敏感性分析，填补策略可能轻微影响营养变量回归效应；
+3. 未检验Cox模型比例风险（PH）假设，后续需补充PH检验验证模型适用性。
+
+## 2.3 多因素Cox回归
+首先选用4项变量构建模型
+
+```{r 多因素Cox回归}
+cox_multi <- coxph(surv_obj ~ age + sex + pat.karno + ecog_group, data = df_final)
+summary_multi <- summary(cox_multi)
+print(summary_multi)
+```
+
+### 多因素Cox比例风险回归模型结果综合解读
+本模型将单因素筛选得到的age、sex、pat.karno、ecog_group纳入多变量校正，消除变量间混杂作用，识别晚期肺癌患者独立预后指标；有效样本227例，死亡终点事件164例，样本与事件量满足建模要求。
+
+1. 模型整体有效性：似然比、Wald、Logrank三项全局检验P均远小于0.001，整套临床基线变量联合可显著解释死亡风险波动；C指数0.655，对患者生存风险具备中等区分能力。
+2. 独立预后指标判定
+   ① 独立保护因素：女性sex，HR=0.576，P=0.00101；校正混杂后女性死亡风险仅为男性的57.6%，保护效应稳定，与性别分层KM曲线结论完全匹配。
+   ② 独立危险因素：重度卧床ecog_group2-3，HR=2.071，P=0.00928；相比无症状患者，重度活动受限人群死亡风险翻倍，为本模型最强不良预后指标。
+3. 校正后失去独立预测价值的变量
+   年龄age、患者自评KPS pat.karno在单因素水平显著，但校正性别、客观ECOG分层后P＞0.05，无独立预后作用；年龄微弱风险、主观体能评分的预后效应均可被客观活动能力、性别混杂解释。
+4. ECOG分层梯度效应：轻症可活动组ecog_group1仅边缘显著（P=0.062），仅当患者进展至重度卧床（2-3分），死亡风险才出现统计学显著升高，提示体能预后存在阈值效应。
+5. 单/多因素差异总结：单因素分析会高估ECOG、自评KPS、年龄的预后作用；消除混杂后，仅性别、重度ECOG卧床状态为真正独立预后指标。
+
+进一步优化得到：
+
+```{r 双因素Cox回归}
+fit <- coxph(surv_obj ~ sex + ecog_group, data = df_final)
+print(summary(fit))
+```
+
+### 性别+ECOG双因素Cox回归模型结果解读
+基于单因素预后筛选结果，将两项强显著临床变量性别、合并ECOG体能分层共同纳入多因素比例风险回归，校正变量间混杂作用，识别独立预后因素。
+
+1. 模型整体有效性：样本总量227例，终点事件164例；似然比、Wald、Log-rank全局检验p均远小于0.001，整套变量联合具备极强的风险区分能力；一致性指数C-index=0.644，模型对死亡风险具备中等预测区分度。
+2. 独立保护因素——女性性别：校正体能状态混杂后，女性HR=0.570，95%CI(0.410,0.792)，P<0.001；女性相较男性死亡风险降低43%，性别是不依赖ECOG评分的独立保护因素，与单因素KM、单Cox结论高度一致。
+3. 独立危险因素——ECOG体能分层（梯度效应）
+    - ECOG=1轻症可活动组：HR=1.533，P<0.05，相比无症状患者死亡风险升高53%；
+    - ECOG=2-3重度卧床组：HR=2.638，P<0.0001，相比无症状患者死亡风险提升164%；
+    校正性别混杂后，体能越差死亡风险越高的梯度预后规律完整保留，ECOG分层为稳定独立危险因素。
+4. 前后分析联动对比：校正混杂后性别、ECOG风险比与单因素模型幅度接近、显著性无丢失，证明两项指标的预后作用真实可靠，并非互相混杂导致的虚假关联。
+
+### 双变量精简Cox模型 vs 四变量全变量模型对比分析
+单因素筛选共得到4项显著变量（sex、ecog_group、age、pat.karno），本研究优先构建性别+ECOG分层双变量精简模型，建模决策优势如下：
+
+1. 规避体能指标多重共线性：pat.karno（自评KPS）与ecog_group（医生ECOG）同源反映患者活动能力，同时纳入4变量模型会出现共线性，压缩变量效应、放大标准误；精简模型仅保留分层梯度更清晰、效应更强的ECOG分组，消除共线性偏差。
+2. 遵循简约建模原则：age仅临界显著，HR=1.019效应幅度微弱，无实际临床预后价值；pat.karno为次要体能指标，二者仅能小幅提升模型C-index，增益有限；剔除弱效应冗余变量后模型更轻量化。
+3. 临床解读逻辑清晰：性别、ECOG体能状态是晚期肺癌公认核心预后标志物，双变量模型聚焦核心风险通路，叙事简洁直观，避免次要变量干扰结论解读。
+4. 分析链条完整闭环：前期分别完成性别、ECOG分层KM单因素生存分析，双变量模型恰好对应两项分层指标，实现「单分层观察差异—多因素校正混杂验证独立效应」的完整分析流程，报告逻辑连贯统一。
+
+模型局限性：未纳入age、pat.karno作为混杂校正变量，无法评估两项次要指标的独立预后作用，模型区分度C-index存在小幅损耗；若需全面校正全部基线混杂，可拓展构建四变量完整模型作为敏感性对照。
+
+### 分析局限
+1. 未检验Cox模型比例风险（PH）假设，无法验证各变量风险比是否随随访时间恒定；
+2. 营养指标wt.loss、meal.cal单因素无统计学意义未纳入模型，缺失值采用单轮级联残差插补，无敏感性分析验证填补策略对回归系数的扰动；
+3. 缺少肿瘤分期、治疗方案、消化道症状等强预后协变量，模型C指数区分能力存在上限。
+
+# 3 数据可视化
+基于前文单因素预后因子批量筛选结果，本研究优先选取性别、合并ECOG体能分层两项核心临床指标构建精简多变量Cox回归模型，规避自评KPS与ECOG同源体能指标带来的多重共线性，同时剔除仅临界显著、临床效应微弱的年龄变量，遵循统计简约建模原则锁定独立预后因素。
+
+为直观可视化校正混杂后的风险效应、95%置信区间与统计学显著性，本节绘制预后森林图；图表可横向对比各组风险比大小、置信区间分布，快速区分保护/危险因素，清晰呈现不同体能分层下的梯度死亡风险，直观验证性别、ECOG状态对晚期肺癌患者生存的独立预测价值，也实现与前期Kaplan-Meier分层生存曲线分析结果的交叉印证。
+
+```{r 森林图}
+model_data <- tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% # 去掉截距项
+  mutate(
+    label = case_when(
+      term == "sexFemale" ~ "Female",
+      term == "ecog_group1 (Symptomatic but ambulatory)" ~ "ECOG 1\n(Symptomatic)",
+      term == "ecog_group2-3 (Bedridden/Severe)" ~ "ECOG 2-3\n(Severe)",
+      TRUE ~ term
+    ),
+    # 格式化 P 值
+    p_val_fmt = ifelse(p.value < 0.001, "<0.001", round(p.value, 3)),
+    # 格式化 HR 和 CI 显示文本
+    hr_text = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high)
+  )
+
+
+p_final <- ggplot(model_data, aes(x = estimate, y = reorder(label, estimate))) +
+  # 绘制置信区间线段
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), height = 0.2, color = "#5C5C5C", size = 0.8) +
+  # 绘制 HR 点 (方块)
+  geom_point(shape = 22, fill = "#2C7BB6", color = "black", size = 5, stroke = 1) +
+  # 添加垂直参考线 (HR=1)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+  # 在右侧添加 P 值文本
+  geom_text(aes(x = max(estimate) * 1.1, label = paste0("p=", p_val_fmt)), 
+            hjust = 0, size = 4.5, fontface = "italic", color = "#D7191C") +
+  # 在中间添加 HR 数值文本 (可选，如果不想太挤可以去掉这行)
+  geom_text(aes(x = estimate, y = label, label = hr_text), vjust = -1.5, size = 3.5) +
+  
+  # 坐标轴和主题
+  scale_x_continuous(limits = c(0, 4.5), breaks = c(0.5, 1, 2, 4), labels = c("0.5", "1.0", "2.0", "4.0")) +
+  labs(
+    title = "Multivariate Cox Regression: Final Model",
+    x = "Hazard Ratio (95% CI)",
+    y = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 20)),
+    axis.text.y = element_text(face = "bold", color = "black"), # Y 轴标签加粗
+    axis.text.x = element_text(color = "black"),
+    panel.grid.major.y = element_blank(), # 去掉横向网格
+    panel.grid.minor = element_blank(),
+    axis.line.y = element_blank(), # 去掉 Y 轴线
+    axis.ticks.y = element_blank() # 去掉 Y 轴刻度
+  )
+
+# 打印最终图表
+print(p_final)
+```
+
+## 多因素Cox回归独立预后风险森林图解读
+本图为性别、合并ECOG分层双变量多因素Cox回归可视化结果，以男性、ECOG=0无症状患者作为共同参照基线；横轴为风险比HR及95%置信区间，中间虚线HR=1为无效应临界线，方块代表各组HR点估计值，横向横线为95%置信区间范围。
+
+1. 女性（Female）：HR=0.57，95%CI(0.41,0.79)，P<0.001
+置信区间完全位于临界线1左侧，为独立保护因素；在校正ECOG体能状态后，女性晚期肺癌患者死亡风险较男性降低43%，生存获益显著。
+2. ECOG 1（轻症可活动）：HR=1.53，95%CI(1.04,2.26)，P=0.032
+置信区间全程在临界线1右侧，为独立危险因素；相比无症状人群，存在症状但可自主活动患者死亡风险升高53%。
+3. ECOG 2-3（重度卧床）：HR=2.64，95%CI(1.70,4.10)，P<0.001
+极强独立危险因素，置信区间远离无效线；重度卧床患者死亡风险为无症状基线人群的2.64倍，体能越差死亡风险呈梯度上升。
+
+整体规律：三条分层置信区间均不跨越HR=1，全部具备统计学独立预后价值；ECOG体能状态存在清晰梯度风险效应，性别为稳定独立保护因素，与前文Kaplan-Meier生存曲线、多因素Cox回归输出结果完全相互印证。
+
+# 4 总结
+本项目完成晚期肺癌数据集完整数据分析，流程分为数据预处理与生存预后建模两大模块。
+
+预处理阶段针对 wt.loss、meal.cal 两项营养指标的不同缺失比例，采用有序级联残差抽样插补策略：先依托基线临床变量预测低缺失率体重丢失指标，再将填补后的体重数据纳入模型完成中度缺失热量指标填充，同时增加生理数值边界约束保证填补结果符合临床逻辑，全程完整保留全部有效样本，生成无缺失分析数据集。
+
+预后分析部分，先通过 Kaplan-Meier 分层生存曲线直观观察性别、ECOG 体能状态带来的生存分层差异；批量单因素 Cox 回归初筛预后变量后，结合多重共线性与临床效应幅度精简模型，剔除同源体能指标与效应微弱的年龄变量，构建性别 + ECOG 分层多因素 Cox 回归；校正混杂后证实女性为独立生存保护因素，患者体能越差死亡风险呈梯度升高，配套森林图可视化各组风险效应并与生存曲线结论交叉印证。分析结果显示体重丢失、日均热量摄入无预后预测价值，仅性别与 ECOG 体能状态可稳定预判晚期肺癌患者长期生存结局。
