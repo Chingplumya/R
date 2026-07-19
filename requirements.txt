@@ -4,3 +4,5 @@ survminer
 broom
 car
 ggplot2
+knitr
+rmarkdown
